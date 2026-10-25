@@ -176,31 +176,36 @@ Cambios en la tabla 7.4 con los datos de escalado:
 
 ### 9.1 Réplica colgada
 
+Prueba: `resultados/colgada.csv` (k6, 10 VUs, 2 min). Congelamiento de `api-2`
+durante 45 s con `docker compose exec api-2 python congelar.py 45`.
+Hora de inicio de k6: [HH:MM:SS]. Hora del comando de congelar:
+
 | Herramienta | ¿Qué mostró sobre `api-2` durante el congelamiento? |
-| --- | --- |
-| Panel de Traefik |  |
-| Objetivos de Prometheus |  |
-| Grafana: réplicas activas |  |
-| Grafana: tráfico por réplica |  |
-| Grafana: porcentaje de fallas |  |
-| `analizar.py` (solicitudes mayores a 5000 ms, máximo, fallas) |  |
+|---|---|
+| Panel de Traefik | [Lo que viste. Si no se capturó: "No se capturó durante el congelamiento; solo hay captura con 3 servidores UP antes de la falla (capturas/traefik_3_servidores.png)".] |
+| Objetivos de Prometheus | [Lo que muestre `up{job="api"}` en el rango del congelamiento, ej. "api-2 se mantuvo en 1" si así sale]. Captura: capturas/prometheus_up_colgada.png |
+| Grafana: réplicas activas | [Lo que veas en el rango 20:21 a 20:26]. Captura: capturas/grafana_replicas_colgada.png |
+| Grafana: tráfico por réplica | [Lo que veas: si api-2 cae a 0, cuánto dura]. Captura: capturas/grafana_trafico_colgada.png |
+| Grafana: porcentaje de fallas | [Lo que veas. "No data" si no hubo fallas.] Captura: capturas/grafana_fallas_colgada.png |
+| `analizar.py` (> 5000 ms, máximo, fallas) | 10 solicitudes mayores a 5000 ms; máximo 45379.1 ms; 0 fallas de 2870 solicitudes. Fuente: `python analizar.py resultados/colgada.csv --umbral 5000` (capturas/analizar_colgada.png) |
+
 
 ### 9.2 Caída del balanceador
 
-Hora de `stop`:  
-Hora de `start`:  
+Hora de `21:09:28`:  
+Hora de `21:10:22`:  
 Solicitudes fallidas según `analizar.py`:  
 Segundos de la prueba con fallas (primera y última):  
+| Panel de Grafana        | Qué mostró durante el corte |
+|-------------------------|-----------------------------|
+| Lecturas por segundo    | Subió a unas 35 lecturas/s, cayó a 0 alrededor de las 21:10 y volvió a subir a unas 20 lecturas/s antes de terminar la prueba. Hay un hueco sin tráfico entre los dos picos. |
+| Tráfico por réplica     | Las tres réplicas (api-1, api-2, api-3) cayeron a 0 al mismo tiempo y volvieron juntas, con dos picos iguales a los del panel anterior. Ninguna réplica falló sola. |
+| p95 del sistema         | La línea se interrumpe durante el corte: no hay valor mientras no llegan solicitudes. Antes del corte estaba entre unos 550 y 800 ms. |
+| p50 y p99 del sistema   | Las dos líneas también se interrumpen durante el corte. El p99 pasó de cerca de 2 s antes del corte a un pico de ~1.3 s después. |
+| Porcentaje de fallas    | **No data** en todo el rango, aunque k6 registró 70 fallas. |
+| Traefik por código HTTP | La línea de HTTP 201 muestra el mismo patrón de dos picos, con un hueco durante el corte (la línea se corta y se reanuda unos segundos después). |
+| Réplicas activas        | Las tres en 1 durante todo el rango (21:08 a 21:10), sin ningún cambio.
 
-| Panel de Grafana | Qué mostró durante el corte |
-| --- | --- |
-| Lecturas por segundo |  |
-| Tráfico por réplica |  |
-| p95 del sistema |  |
-| p50 y p99 del sistema |  |
-| Porcentaje de fallas |  |
-| Traefik por código HTTP |  |
-| Réplicas activas |  |
 
 ### 9.3 Dominios de falla del laboratorio
 
@@ -254,7 +259,19 @@ Consulta corregida:
 
 ### 6. Caída de Traefik: CSV contra Grafana
 
+Según el CSV, fallaron 70 de 2401 solicitudes, entre el segundo 50 y el 104 (python analizar.py resultados/sin_traefik.csv). En Grafana, el panel de porcentaje de fallas mostró No data (captura: capturas/[archivo].png).
+
+Diferencia: esas solicitudes nunca llegaron a la API, porque Traefik estaba detenido. El panel de fallas lee el histograma de la propia API, así que no las contó. k6 sí las vio porque mide desde el cliente.
+
+Implicación para Smart City: el dashboard solo mide desde dentro de la aplicación y no detecta fallas de lo que está antes de ella. Hace falta monitorear también el balanceador (up{job="traefik"}), alertar cuando los datos desaparecen, medir desde fuera con pruebas como las de k6 y eliminar el SPOF con más de un balanceador.
+
 ### 7. Réplica congelada
+
+Solicitudes mayores a 5 s: 10 (máximo 45379 ms, 0 fallas, porque el timeout de k6 es de 60 s y las solicitudes terminaron respondiendo al descongelarse). Fuente: python analizar.py resultados/colgada.csv --umbral 5000.
+Prometheus: [activa (up = 1), siempre que tu captura de up{job="api"} lo muestre].
+Por qué Traefik la sacó y Prometheus no lo notó: Traefik consulta /salud, que en app.py se retiene mientras la réplica está congelada, así que no respondió en 2 s. Prometheus consulta /metrics, que está exento del congelamiento, y por eso la siguió viendo activa.
+Parámetros de Traefik: healthcheck.interval=5s y healthcheck.timeout=2s.
+Costo de reducirlos: más tráfico de chequeos y más falsos positivos. Una réplica solo lenta, como api-3 con 0.25 CPU, podría sacarse sin estar rota.
 
 ### 8. Réplicas necesarias para (50 × grupo) lecturas/s
 
