@@ -318,3 +318,56 @@ Consulta de p95 por réplica:
 Nota sobre la precisión: el p95 de api-1 y api-2 (~95 ms) es una estimación de Prometheus. Sus solicitudes caen casi todas en el primer bucket (0 a 0.1 s), y Prometheus supone que se reparten uniformemente dentro de él, por eso da un valor cercano a 100 ms aunque la mediana medida por k6 es de 23.8 ms.
 
 Observación para el panel "p95 del sistema" (pregunta 4): el panel promedia los p95 de cada réplica, (95.3 + 98.3 + 977.5) / 3 ≈ 390 ms, mientras el p95 real de escalado según `analizar.py` es 701.3 ms.
+
+## Preguntas de defensa: Parte C (Cindy)
+
+### 1. Predicción contra resultados
+
+Commit de la predicción: `2cf2cd4 Prediccion antes de escalar` (`git log --oneline`, captura C0), hecho antes de `docker compose up -d api-2 api-3`.
+
+| Medida | base_cindy | Predicción | escalado (medido) | ¿Acertamos? |
+| --- | --- | --- | --- | --- |
+| Throughput (lecturas/s) | 33.99 | ~50 (factor ~1.5) | 49.18 (factor 1.45) | Sí, casi exacto |
+| p50 (ms) | 289.0 | ~60 | 23.8 | La dirección sí; bajó más de lo esperado |
+| p99 (ms) | 696.1 | ~700 o más | 1096.0 | La dirección sí; empeoró más de lo esperado |
+
+**En qué acertamos:** que el throughput no se triplicaría y quedaría cerca de 1.5 veces, porque Traefik reparte en partes iguales y api-3 (`cpus: 0.25`) limita al sistema. Que el p50 bajaría porque 2/3 de las lecturas van a réplicas con CPU de sobra. Que el p99 no mejoraría, porque la cola sale de api-3.
+
+**En qué nos equivocamos:** sobreestimamos la latencia de las réplicas rápidas (predijimos ~60 ms y la mediana fue 23.8 ms). Con api-1 y api-2 al ~50 % de su CPU (captura C5) casi no hay fila, y cada lectura tarda poco más que su tiempo de servicio (1 / 34 s ≈ 29 ms con 0.5 CPU). También subestimamos cuánto empeoraría la cola: el p99 subió 57 % y el máximo pasó de 1132.8 a 2054.4 ms.
+
+**Qué no consideramos:** que el p95 también empeoraría (433.9 → 701.3 ms). Como api-3 recibe 1/3 de las solicitudes y es la lenta, más del 5 % de todas las lecturas son lentas, así que el p95 ya cae dentro del grupo de api-3. Tampoco consideramos que el panel "p95 del sistema" de Grafana ocultaría este efecto al promediar los p95 de las réplicas (≈ 390 ms contra 701.3 ms reales).
+
+### 2. ¿Por qué se triplicó el throughput?
+
+No se triplicó. Según `analizar.py`, pasó de 33.99 a 49.18 lecturas/s: un factor de **1.45**, no 3.
+
+Evidencia:
+1. **Las tres réplicas reciben lo mismo.** `sum by (instance) (rate(smartcity_solicitud_duracion_segundos_count[2m]))` evaluada al final de escalado (captura C8b) da 16.82, 16.62 y 16.51 lecturas/s. Traefik usa round-robin con peso 1 para cada servidor (captura C3).
+2. **api-3 tiene la mitad de CPU.** En `docker-compose.yml`, api-1 y api-2 tienen `cpus: 0.5` y api-3 tiene `cpus: 0.25`. El trabajo de cada lectura (`firmar`, 8400 iteraciones de SHA-256 para el grupo 1) es casi todo CPU.
+3. **api-3 está saturada y las otras no.** `docker stats` durante la carga (captura C5): api-3 usa 25.58 % (~100 % de su límite), api-1 24.96 % y api-2 22.99 % (~50 % del suyo). PostgreSQL usa 5.82 %, así que no es el cuello de botella.
+
+Con 1 réplica de 0.5 CPU el sistema acepta ~34/s, así que api-3 con 0.25 CPU aguanta ~17/s. Como el balanceador le manda 1/3 del tráfico a cada réplica, el sistema llega a su límite cuando api-3 se satura: 3 × ~17 ≈ 51/s, muy cerca de los 49.18 medidos. La CPU total subió 2.5 veces (de 0.5 a 1.25), pero el reparto parejo deja sin usar la mitad de la capacidad de api-1 y api-2.
+
+Por la ley de Little (L = 10 VUs fijo): L = 49.18 × 0.2015 ≈ 9.9. Si λ no se triplicó, W tampoco se dividió entre 3: pasó de 291.7 a 201.5 ms.
+
+Para acercarse a 3 veces habría que darle a api-3 la misma CPU (0.5), o usar pesos en el balanceador proporcionales a la CPU (2:2:1), que aprovecharían hasta ~2.5 veces.
+
+### 3. ¿Qué pasó con el p50 y el p99?
+
+Fuente: `analizar.py` sobre base_cindy.csv y escalado.csv (capturas C1 y C7).
+- **p50:** 289.0 → 23.8 ms (mejoró ~12 veces).
+- **p99:** 696.1 → 1096.0 ms (**empeoró** 57 %). El p95 también empeoró: 433.9 → 701.3 ms.
+
+**Réplica responsable: api-3.** Consulta PromQL, evaluada en 2026-10-25 02:51:41 UTC (fin de escalado, captura C9b):
+
+`histogram_quantile(0.95, sum by (le, instance) (rate(smartcity_solicitud_duracion_segundos_bucket[2m]))) * 1000`
+
+| Réplica | p95 (ms) |
+| --- | --- |
+| api-1 | 95.3 |
+| api-2 | 98.3 |
+| api-3 | 977.5 |
+
+La gráfica en el tiempo (captura C9) muestra lo mismo durante toda la prueba: api-3 se mantiene cerca de 1 s mientras las otras dos quedan cerca de 100 ms.
+
+**Causa:** api-3 tiene `cpus: 0.25` y recibe la misma cantidad de lecturas que las otras (~16.5/s, captura C8b). Trabaja al ~100 % de su límite (25.58 % en `docker stats`, captura C5), así que las lecturas le hacen fila. Como 1/3 de todas las solicitudes pasa por api-3, la distribución se partió en dos grupos (histograma de escalado): la mediana cae en el grupo rápido (api-1 y api-2) y por eso mejoró, mientras el p95 y el p99 caen en el grupo lento (api-3) y por eso empeoraron. Agregar una réplica más lenta que las demás, con reparto parejo, mejora la experiencia típica pero empeora la de los usuarios con peor suerte.
