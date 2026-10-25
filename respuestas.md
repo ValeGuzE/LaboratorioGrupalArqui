@@ -259,3 +259,22 @@ Consulta corregida:
 ### 8. Réplicas necesarias para (50 × grupo) lecturas/s
 
 ### 9. Mejora mínima para considerarla real
+
+
+## Parte C: Escalamiento horizontal
+
+### Base en la máquina de Cindy (1 réplica)
+
+Fuente: `python analizar.py resultados/base_cindy.csv` (corrida de 20:26:24 a 20:28:24, capturas C1 y C1b).
+
+| Medida | base_cindy |
+| --- | --- |
+| Throughput (lecturas/s) | 33.99 |
+| Media (ms) | 291.7 |
+| Mediana (ms) | 289.0 |
+| p90 (ms) | 394.6 |
+| p95 (ms) | 433.9 |
+| p99 (ms) | 696.1 |
+| Máximo (ms) | 1132.8 |
+
+Comprobación con la ley de Little: L = 33.99 × 0.2917 ≈ 9.9 ≈ 10 VUs.
