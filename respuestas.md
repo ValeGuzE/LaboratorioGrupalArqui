@@ -278,3 +278,43 @@ Fuente: `python analizar.py resultados/base_cindy.csv` (corrida de 20:26:24 a 20
 | Máximo (ms) | 1132.8 |
 
 Comprobación con la ley de Little: L = 33.99 × 0.2917 ≈ 9.9 ≈ 10 VUs.
+
+### 8.4 Comparación: 1 réplica contra 3 réplicas
+
+Fuentes: `python analizar.py resultados/base_cindy.csv` (20:26:24 – 20:28:24, captura C1) y `python analizar.py resultados/escalado.csv` (20:49:41 – 20:51:41, capturas C7 y C7b). Ambas corridas en la misma máquina, con 10 VUs durante 2 minutos.
+
+| Medida | base_cindy | escalado | Factor (escalado / base) |
+| --- | --- | --- | --- |
+| Throughput (lecturas/s) | 33.99 | 49.18 | 1.45 |
+| p50 (ms) | 289.0 | 23.8 | 0.08 |
+| p95 (ms) | 433.9 | 701.3 | 1.62 |
+| p99 (ms) | 696.1 | 1096.0 | 1.57 |
+| Máximo (ms) | 1132.8 | 2054.4 | 1.81 |
+
+Ley de Little en escalado: L = 49.18 × 0.2015 ≈ 9.9 ≈ 10 VUs.
+
+**¿Cambió la forma de la distribución?** Sí. En base_cindy el histograma tiene una sola montaña alrededor de 290 ms. En escalado la distribución se separa en dos grupos: la mayoría de las lecturas queda muy a la izquierda (decenas de ms) y aparece una cola larga hacia la derecha, entre 600 y 2000 ms. No solo se movió: pasó de un solo grupo a dos grupos con comportamientos distintos. Por eso la mediana bajó mucho mientras el p95, el p99 y el máximo subieron.
+
+### 8.5 Investigación por réplica
+
+Fuentes: consultas de Prometheus en la pestaña Table, evaluadas en 2026-10-25 02:51:41 UTC (20:51:41 hora local, fin de escalado), con ventana `[2m]` para cubrir toda la corrida (capturas C8b y C9b). Gráficas en el tiempo: capturas C8 y C9. CPU: `docker stats --no-stream` durante una carga idéntica de 60 s con las mismas 3 réplicas (captura C5).
+
+Consulta de solicitudes por réplica:
+`sum by (instance) (rate(smartcity_solicitud_duracion_segundos_count[2m]))`
+
+Consulta de p95 por réplica:
+`histogram_quantile(0.95, sum by (le, instance) (rate(smartcity_solicitud_duracion_segundos_bucket[2m]))) * 1000`
+
+| Réplica | Límite de CPU (`docker-compose.yml`) | Solicitudes/s | p95 (ms) | CPU en `docker stats` | Uso de su límite |
+| --- | --- | --- | --- | --- | --- |
+| api-1 | 0.5 | 16.82 | 95.3 | 24.96 % | ~50 % |
+| api-2 | 0.5 | 16.62 | 98.3 | 22.99 % | ~46 % |
+| api-3 | 0.25 | 16.51 | 977.5 | 25.58 % | ~100 % |
+
+**¿Reciben la misma cantidad de solicitudes?** Sí. Las tres reciben ~16.5 lecturas/s, porque Traefik reparte por round-robin con el mismo peso (Weight = 1 en el panel de Traefik, captura C3), sin considerar cuánta CPU tiene cada una.
+
+**¿Responden con la misma latencia?** No. api-3 tiene un p95 unas 10 veces mayor que las otras dos. Tiene la mitad de CPU (`cpus: 0.25`) y recibe el mismo tráfico, así que trabaja al ~100 % de su límite y se le forma fila, mientras api-1 y api-2 usan solo la mitad de su CPU. PostgreSQL usa ~6 % de su CPU, así que no es el cuello de botella.
+
+Nota sobre la precisión: el p95 de api-1 y api-2 (~95 ms) es una estimación de Prometheus. Sus solicitudes caen casi todas en el primer bucket (0 a 0.1 s), y Prometheus supone que se reparten uniformemente dentro de él, por eso da un valor cercano a 100 ms aunque la mediana medida por k6 es de 23.8 ms.
+
+Observación para el panel "p95 del sistema" (pregunta 4): el panel promedia los p95 de cada réplica, (95.3 + 98.3 + 977.5) / 3 ≈ 390 ms, mientras el p95 real de escalado según `analizar.py` es 701.3 ms.
