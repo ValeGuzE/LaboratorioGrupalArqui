@@ -71,45 +71,78 @@ Entre dos corridas idénticas, el p95 bajó 11.5 % (de 710.2 a 628.3 ms) y el th
 
 ## Parte B: observabilidad
 
+### 7.1 Las métricas crudas
+
+Fuente: `curl.exe -s http://localhost:8000/metrics`, filtrado con `findstr smartcity_solicitud_duracion_segundos`.
+
+Salen las tres series. `_bucket` es acumulado: cada `le` incluye a los anteriores. En la captura, `le="0.1"` va en 10096 y desde `le="0.5"` hasta `+Inf` todos están en 14409, igual que el `_count`. Entonces 4313 lecturas tardaron más de 100 ms y ninguna pasó de 500 ms. El `_sum` da 1283.92 segundos.
+
+Los `le` son 0.1, 0.5, 1.0, 2.5, 5.0, 10.0 y `+Inf`. En `app.py` los buckets son `(0.1, 0.5, 1.0, 2.5, 5.0, 10.0)`. Coinciden. El `+Inf` lo agrega la librería.
+
+El count (14409) es más alto que las 12280 del CSV porque el proceso no se reinició entre el calentamiento de 20 s y la prueba de 2 min.
+
 ### 7.2 Consultas PromQL
+
+Prometheus de esta máquina no tiene la ventana de base1: a las 15:49:05 el contador sigue en 1. La comparación de abajo es de la corrida de las 19:11:33 a las 19:13:33, la que sí quedó scrapeada. Misma prueba (10 VUs, 2 min). CSV: `resultados/obs.csv`.
 
 1. Contador crudo, qué información útil da:
 
+Solo sube: 1960, 4951, 8028, 11108 y 14180, cada 30 s. No dice latencia ni errores. Sirve para ver que el proceso no se reinició. La pendiente se puede leer a ojo: 14180 - 1960 = 12220 en 120 s, unos 102 por segundo. Para eso está `rate()`.
+
 2. Tasa por segundo comparada con el throughput de la Parte A:
+
+`sum(rate(smartcity_solicitud_duracion_segundos_count[2m]))` a las 19:13:33 dio 102.38 lecturas/s. `analizar.py` de esta corrida dio 101.49 y k6 102.32. Quedan juntos. No es el 21.10 de base1: esa corrida fue en la VM, y aquí la misma prueba salió mucho más rápida (p95 del CSV 161.3 ms contra 710.2 ms allá).
+
+3. p95 con ventana de 2 min, evaluado a las 19:13:33: 435.08 ms.
 
 ### 7.3 Prometheus contra el cálculo a mano
 
+Fuente del p95 a mano: `python analizar.py resultados/obs.csv` (161.3 ms). k6 dijo `p(95)=161.33ms`. Fuente de Prometheus: `histogram_quantile(0.95, sum by (le) (rate(smartcity_solicitud_duracion_segundos_bucket[2m]))) * 1000` a las 19:13:33.
+
 | Corrida | p95 calculado con `analizar.py` (ms) | p95 estimado por Prometheus (ms) | Diferencia (%) |
 | --- | --- | --- | --- |
-| base1 |  |  |  |
+| base1 | 710.2 | sin datos (contador en 1 a las 15:49) |  |
+| 19:11 a 19:13 | 161.3 | 435.1 | +169.7 |
+
+Diferencia = (435.1 - 161.3) / 161.3 × 100.
 
 1. Entre qué límites `le` cae el p95 y qué supone Prometheus dentro del bucket:
 
+435 ms cae entre `le="0.1"` y `le="0.5"`. Prometheus no vio el tiempo de cada solicitud, solo cuántas cayeron en ese rango. Supone que adentro se reparten parejo. Por eso llega a 435 ms aunque en el CSV el máximo fue 204.6 ms: de 200 a 500 el bucket está vacío y la cuenta lineal igual lo recorre.
+
 2. Tiempo que queda fuera de la medición del servidor:
+
+k6 mide desde que manda la lectura hasta que vuelve la respuesta. La API mide adentro del proceso. Afuera queda Traefik, la red y el armado del JSON. En base1 el reloj de la VM saltaba y el p99 del cliente se fue a 2395.7 ms. Aquí no pasó: el máximo de `http_req_duration` es 204.6 ms y el de la iteración 204.7 ms.
 
 3. Cuál p95 reportarían a un gerente y por qué:
 
+El 161.3 ms, el del cliente, porque es lo que esperó el sensor. El 435 de Prometheus no es la latencia real, es el hueco del bucket.
+
 4. Qué cambiarían en `app.py` y qué costo tendría:
+
+Buckets más juntos donde de verdad caen las lecturas, por ejemplo 0.05, 0.1, 0.15, 0.2, 0.3 y 0.5. Cuesta más series en Prometheus: más memoria y un poco más de trabajo en cada scrape.
 
 ### 7.4 Lectura crítica del dashboard
 
+Valores a las 19:13:33, con la ventana de 30 s que trae cada panel. No son de base1: de esa hora Prometheus no tiene serie.
+
 | Panel | ¿Qué pregunta responde? | Valor observado durante base1 | ¿La responde correctamente? ¿Cómo lo saben? |
 | --- | --- | --- | --- |
-| Lecturas por segundo |  |  |  |
-| Tráfico por réplica |  |  |  |
-| p95 del sistema |  |  |  |
-| p50 y p99 del sistema |  |  |  |
-| Porcentaje de fallas |  |  |  |
-| Traefik por código HTTP |  |  |  |
-| Réplicas activas |  |  |  |
+| Lecturas por segundo | ¿Cuántas lecturas por segundo acepta? | 102.80 en esta corrida (base1 no está en Prometheus; allá el throughput fue 21.10) | Sí para esta corrida. `analizar.py` dio 101.49 y k6 102.32. La ventana de 30 s no tiene que salir idéntica. |
+| Tráfico por réplica | ¿Cómo se reparte? | solo api-1, 102.80 | Sí. api-2 y api-3 no están levantadas. |
+| p95 del sistema | ¿Cuál es el p95, en ms? | 432.0 | No. El p95 de las solicitudes es 161.3 ms. Con una sola réplica el `avg()` del panel no cambia el número. El error es el bucket de 0.1 a 0.5. |
+| p50 y p99 del sistema | ¿Cuál es el p50 y el p99? | 70.8 y 486.4 | El p50 se acerca a la mediana del CSV (99.1) pero interpola dentro de 0 a 100 ms y no incluye a Traefik. El p99 no: en el CSV es 173.0 y el panel dice 486. |
+| Porcentaje de fallas | ¿Qué porcentaje falla? | la consulta no devuelve serie | No del todo. k6 falló 0 de 12280. Si no existe la serie `estado!="201"`, el panel queda vacío y vacío no es 0%. |
+| Traefik por código HTTP | ¿Cuántas solicitudes van por código? | HTTP 201 en 102.53 y HTTP 200 en 0 | Sí. Empata con las lecturas aceptadas. |
+| Réplicas activas | ¿Cuáles reporta Prometheus? | api-1 = 1, api-2 = 0, api-3 = 0 | Sí. Solo api-1 está arriba. |
 
 Método RED:
 
 | Letra | Paneles |
 | --- | --- |
-| R (Rate) |  |
-| E (Errors) |  |
-| D (Duration) |  |
+| R (Rate) | Lecturas por segundo, tráfico por réplica y Traefik por código |
+| E (Errors) | Porcentaje de fallas, y el código de Traefik si apareciera un 5xx |
+| D (Duration) | p50, p95 y p99 |
 
 ## Parte C: escalamiento horizontal
 
